@@ -1,0 +1,101 @@
+#include "stm32f10x.h"                  // Device header
+
+/**
+  * @file    main.c
+  * @brief   STM32F103C8T6 纯寄存器流水灯 (适配 ARM Compiler V6)
+  *          硬件映射：
+  *          - 黄灯 A: PA4  (低电平点亮)
+  *          - 绿灯 B: PB0  (低电平点亮)
+  *          - 红灯 C: PC15 (低电平点亮)
+  */
+
+#include <stdint.h>
+
+/* ================= 1. 寄存器物理地址映射 ================= */
+#define RCC_APB2ENR_REG   (*(volatile uint32_t *)0x40021018)
+
+#define GPIOA_CRL_REG     (*(volatile uint32_t *)0x40010800)
+#define GPIOA_ODR_REG     (*(volatile uint32_t *)0x4001080C)
+
+#define GPIOB_CRL_REG     (*(volatile uint32_t *)0x40010C00) // PB0 位于 CRL 寄存器
+#define GPIOB_ODR_REG     (*(volatile uint32_t *)0x40010C0C)
+
+#define GPIOC_CRH_REG     (*(volatile uint32_t *)0x40011004) // PC13 位于 CRH 寄存器 Bits[23:20]
+#define GPIOC_ODR_REG     (*(volatile uint32_t *)0x4001100C)
+
+
+/* ================= 2. 函数声明 ================= */
+static void Delay_ms(volatile uint32_t t);
+static void A_Yellow_LIGHT(void);
+static void B_Green_LIGHT(void);
+static void C_Red_LIGHT(void);
+
+
+/* ================= 3. 延时及灯光控制函数 ================= */
+
+/* 软件延时 */
+static void Delay_ms(volatile uint32_t t) {
+    volatile uint32_t i;
+    while (t--) {
+        for (i = 0; i < 800; i++);
+    }
+}
+
+/* 点亮黄灯 PA4，熄灭绿灯 PB0 和红灯 PC13 */
+static void A_Yellow_LIGHT(void) {
+    GPIOA_ODR_REG &= ~(1U << 4);  // PA4  = 0 (低电平点亮黄灯)
+    GPIOB_ODR_REG |=  (1U << 0);  // PB0  = 1 (高电平熄灭绿灯)
+    GPIOC_ODR_REG |=  (1U << 13); // PC13 = 1 (高电平熄灭板载灯)
+}
+
+/* 点亮绿灯 PB0，熄灭黄灯 PA4 和红灯 PC13 */
+static void B_Green_LIGHT(void) {
+    GPIOA_ODR_REG |=  (1U << 4);  // PA4  = 1 (高电平熄灭黄灯)
+    GPIOB_ODR_REG &= ~(1U << 0);  // PB0  = 0 (低电平点亮绿灯)
+    GPIOC_ODR_REG |=  (1U << 13); // PC13 = 1 (高电平熄灭板载灯)
+}
+
+/* 点亮板载红灯 PC13，熄灭黄灯 PA4 和绿灯 PB0 */
+static void C_Red_LIGHT(void) {
+    GPIOA_ODR_REG |=  (1U << 4);  // PA4  = 1 (高电平熄灭黄灯)
+    GPIOB_ODR_REG |=  (1U << 0);  // PB0  = 1 (高电平熄灭绿灯)
+    GPIOC_ODR_REG &= ~(1U << 13); // PC13 = 0 (低电平点亮板载灯)
+}
+
+
+/* ================= 4. 主程序 ================= */
+int main(void) {
+    /* 1. 开启 GPIOA, GPIOB, GPIOC 的外设时钟 */
+    RCC_APB2ENR_REG |= (1U << 2) | (1U << 3) | (1U << 4);
+
+    /* 2. 配置 GPIO 为通用推挽输出 50MHz (MODE=11, CNF=00，即 0x3) */
+    
+    // 配置 PA4 (CRL 寄存器 Bits[19:16])
+    GPIOA_CRL_REG &= ~(0xFU << 16); // 清除配置
+    GPIOA_CRL_REG |=  (0x3U << 16); // 推挽输出 50MHz
+
+    // 配置 PB0 (CRL 寄存器 Bits[3:0])
+    GPIOB_CRL_REG &= ~(0xFU << 0);  // 清除配置
+    GPIOB_CRL_REG |=  (0x3U << 0);  // 推挽输出 50MHz
+
+    // 配置 PC13 (CRH 寄存器 Bits[23:20]) -> 公式：(13 - 8) * 4 = 20
+    GPIOC_CRH_REG &= ~(0xFU << 20); // 清除 Bits[23:20] 原始配置
+    GPIOC_CRH_REG |=  (0x3U << 20); // 配置为通用推挽输出 50MHz
+
+    /* 3. 初始状态：全部输出高电平（保持熄灭） */
+    GPIOA_ODR_REG |= (1U << 4);
+    GPIOB_ODR_REG |= (1U << 0);
+    GPIOC_ODR_REG |= (1U << 13);
+
+    /* 4. 循环：红灯(PC13) -> 黄灯(PA4) -> 绿灯(PB0) 轮流点亮 */
+    while (1) {
+        C_Red_LIGHT();    // 点亮 PC13 板载灯
+        Delay_ms(5000);
+
+        A_Yellow_LIGHT(); // 点亮 PA4 外接黄灯
+        Delay_ms(5000);
+
+        B_Green_LIGHT();  // 点亮 PB0 外接绿灯
+        Delay_ms(5000);
+    }
+}
