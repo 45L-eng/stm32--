@@ -1,0 +1,624 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : DHT20 / AHT20 温湿度采集终端（STM32F103C8）
+  *
+  *   硬件:  I2C1 重映射 -> PB8=SCL, PB9=SDA, 100kHz, 从机地址 0x38
+  *          USART1 重映射 -> PB6=TX, PB7=RX, 115200 8-N-1
+  *          PA0 心跳指示（低电平点亮，500ms 翻转）
+  *
+  *   串口输出为仪器仪表风格:
+  *          开机打印设备信息横幅 -> 表格表头 -> 每 2 秒一行采样
+  *          每 10 次成功采样打印一行统计（含极值、失败次数）
+  *          出错时打印 WARN/FAIL 并自动重新探测传感器
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "aht20.h"
+#include <string.h>
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* ---------------- 运行状态（全部放在 USER CODE 区，CubeMX 重新生成不会丢） ---------------- */
+
+uint8_t  aht20_ok;        /* 1 = 传感器在线，0 = 未检测到 */
+uint32_t tick_send;       /* 上次采样时刻 */
+uint32_t tick_led;        /* 上次心跳翻转时刻 */
+uint32_t sample_no;       /* 成功采样次数（同时作为表格行号） */
+uint32_t fail_cnt;        /* 累计失败次数（读超时 + 离线重试） */
+float    t_val, h_val;    /* 本次温度 / 湿度 */
+float    t_min, t_max;    /* 温度极值 */
+float    h_min, h_max;    /* 湿度极值 */
+uint8_t  have_minmax;     /* 极值是否已经建立 */
+char     msg[160];        /* 串口组包缓冲区 */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* 采样周期与统计周期 */
+#define SAMPLE_PERIOD_MS   2000U   /* 每 2 秒采集一次 */
+#define HEARTBEAT_MS        500U   /* 每 500ms 翻转心跳灯 */
+#define SAMPLES_PER_STAT     10U   /* 每 10 次成功采样打一行统计 */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
+UART_HandleTypeDef huart1;
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_USART1_UART_Init(void);
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+/* ============================ 字符串拼装小工具 ============================ */
+
+/**
+  * @brief  把浮点数格式化为十进制字符串（不依赖 printf 的浮点支持）
+  * @note   先整体四舍五入到 dec 位小数，再拆整数 / 小数部分，
+  *         这样 25.96 会正确进位成 "26.0"，而不会被截断成 "25.0"。
+  */
+static char *FmtFloat(char *buf, float val, uint8_t dec)
+{
+    static const int32_t pow10[4] = {1, 10, 100, 1000};
+    int32_t scale, scaled, ip, fp;
+    int8_t  i, j;
+    char   *p = buf;
+    char    tmp[12];
+    uint8_t neg;
+
+    scale  = pow10[dec];
+    neg    = (val < 0.0f) ? 1U : 0U;
+    if (neg != 0U) { val = -val; }
+
+    scaled = (int32_t)(val * (float)scale + 0.5f);   /* 放大后四舍五入 */
+    if (scaled == 0) { neg = 0U; }                   /* 不输出 "-0.0" */
+
+    if (neg != 0U) { *p++ = '-'; }
+    fp = scaled % scale;
+    ip = scaled / scale;
+
+    i = 0;
+    if (ip == 0) { tmp[i++] = '0'; }
+    while (ip > 0)
+    {
+        tmp[i++] = (char)('0' + (ip % 10));
+        ip /= 10;
+    }
+    while (i > 0) { *p++ = tmp[--i]; }
+
+    if (dec > 0U)
+    {
+        int32_t d = scale;
+        *p++ = '.';
+        for (j = (int8_t)dec - 1; j >= 0; j--)
+        {
+            d /= 10;
+            *p++ = (char)('0' + (fp / d) % 10);
+        }
+    }
+    *p = '\0';
+    return buf;
+}
+
+/**
+  * @brief  把 src 追加到 dst 末尾（dst 必须有足够空间）
+  */
+static void AppendStr(char *dst, const char *src)
+{
+    while (*dst != '\0') { dst++; }
+    while (*src != '\0') { *dst++ = *src++; }
+    *dst = '\0';
+}
+
+/**
+  * @brief  追加无符号整数，右对齐到 width 列，不足补 pad
+  */
+static void AppendU32(char *dst, uint32_t val, uint8_t width, char pad)
+{
+    char   tmp[12];
+    char  *p = dst;
+    int8_t i = 0;
+    int8_t n;
+
+    while (*p != '\0') { p++; }
+
+    if (val == 0U) { tmp[i++] = '0'; }
+    while (val > 0U)
+    {
+        tmp[i++] = (char)('0' + (val % 10U));
+        val /= 10U;
+    }
+    n = i;
+    while (n < (int8_t)width) { *p++ = pad; n++; }
+    while (i > 0) { *p++ = tmp[--i]; }
+    *p = '\0';
+}
+
+/**
+  * @brief  追加 1 位（或 dec 位）小数的浮点数，右对齐到 width 列
+  */
+static void AppendF(char *dst, float val, uint8_t dec, uint8_t width)
+{
+    char    tmp[16];
+    char   *p = dst;
+    uint8_t len;
+    uint8_t k;
+
+    (void)FmtFloat(tmp, val, dec);
+
+    while (*p != '\0') { p++; }
+    len = (uint8_t)strlen(tmp);
+    while (len < width) { *p++ = ' '; len++; }
+    for (k = 0U; tmp[k] != '\0'; k++) { *p++ = tmp[k]; }
+    *p = '\0';
+}
+
+/**
+  * @brief  把毫秒数格式化成 HH:MM:SS 并追加到 dst
+  */
+static void AppendUptime(char *dst, uint32_t ms)
+{
+    uint32_t s = ms / 1000U;
+
+    AppendU32(dst, (s / 3600U) % 100U, 2U, '0');
+    AppendStr(dst, ":");
+    AppendU32(dst, (s / 60U) % 60U, 2U, '0');
+    AppendStr(dst, ":");
+    AppendU32(dst, s % 60U, 2U, '0');
+}
+
+/**
+  * @brief  根据温湿度给一个粗略的舒适度标签
+  * @note   纯阈值判断，不使用 math 库，逻辑简单直观
+  */
+static const char *ComfortTag(float t, float h)
+{
+    if (h < 30.0f) { return "VERY DRY"; }
+    if (h < 40.0f) { return "DRY";      }
+    if (h > 75.0f) { return "WET";      }
+    if (h > 65.0f) { return "HUMID";    }
+    if (t < 18.0f) { return "COOL";     }
+    if (t > 28.0f) { return "HOT";      }
+    return "COMFORT";
+}
+
+/* ============================== 串口输出 ============================== */
+
+/**
+  * @brief  通过 USART1 发送一个字符串（阻塞方式，超时 100ms）
+  */
+static void UartSend(const char *str)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t *)str, (uint16_t)strlen(str), 100U);
+}
+
+/**
+  * @brief  打印开机横幅：把板子当前的硬件配置一次性交代清楚
+  */
+static void PrintBanner(void)
+{
+    UartSend("\r\n");
+    UartSend("================================================================\r\n");
+    UartSend("  STM32F103C8 | DHT20 / AHT20 ENVIRONMENT MONITOR\r\n");
+    UartSend("  FW v2.1     | SYSCLK 64 MHz (HSI)  Flash 64 KB\r\n");
+    UartSend("  I2C1        | PB8=SCL PB9=SDA  100 kHz  7-bit 0x38\r\n");
+    UartSend("  USART1      | PB6=TX  PB7=RX   115200 8-N-1\r\n");
+    UartSend("  LED         | PA0 heartbeat 500 ms\r\n");
+    UartSend("================================================================\r\n");
+}
+
+/**
+  * @brief  打印数据表格的表头
+  */
+static void PrintTableHeader(void)
+{
+    UartSend("----------------------------------------------------------------\r\n");
+    UartSend("    #  UPTIME     TEMP(C)    HUMI(%)   COMFORT\r\n");
+    UartSend("----------------------------------------------------------------\r\n");
+}
+
+/**
+  * @brief  打印一行采样数据
+  * @note   列宽与表头一一对应：
+  *           序号 3 列右对齐 / 运行时间 8 列 / 温度 7 列右对齐 /
+  *           湿度 7 列右对齐 / 舒适度左对齐
+  */
+static void PrintRow(uint32_t idx, uint32_t uptime_ms, float t, float h)
+{
+    msg[0] = '\0';
+    AppendStr(msg, "  ");
+    AppendU32(msg, idx, 3U, ' ');
+    AppendStr(msg, "  ");
+    AppendUptime(msg, uptime_ms);
+    AppendStr(msg, "   ");
+    AppendF(msg, t, 1U, 7U);
+    AppendStr(msg, "    ");
+    AppendF(msg, h, 1U, 7U);
+    AppendStr(msg, "   ");
+    AppendStr(msg, ComfortTag(t, h));
+    AppendStr(msg, "\r\n");
+    UartSend(msg);
+}
+
+/**
+  * @brief  打印统计行：采样次数、失败次数、温湿度极值
+  */
+static void PrintStat(void)
+{
+    msg[0] = '\0';
+    AppendStr(msg, "[STAT] ok=");
+    AppendU32(msg, sample_no, 0U, ' ');
+    AppendStr(msg, "  fail=");
+    AppendU32(msg, fail_cnt, 0U, ' ');
+    AppendStr(msg, "  T=");
+    AppendF(msg, t_min, 1U, 0U);
+    AppendStr(msg, "..");
+    AppendF(msg, t_max, 1U, 0U);
+    AppendStr(msg, " C   H=");
+    AppendF(msg, h_min, 1U, 0U);
+    AppendStr(msg, "..");
+    AppendF(msg, h_max, 1U, 0U);
+    AppendStr(msg, " %\r\n");
+    UartSend(msg);
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+  GPIO_InitTypeDef gpio_led = {0};
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_USART1_UART_Init();
+  /* USER CODE BEGIN 2 */
+
+  /* ---- 心跳灯：PA0 推挽输出，低电平点亮 ---- */
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  gpio_led.Pin   = GPIO_PIN_0;
+  gpio_led.Mode  = GPIO_MODE_OUTPUT_PP;
+  gpio_led.Pull  = GPIO_NOPULL;
+  gpio_led.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &gpio_led);
+
+  /* ---- 运行状态清零 ---- */
+  tick_led    = HAL_GetTick();
+  tick_send   = HAL_GetTick();
+  sample_no   = 0U;
+  fail_cnt    = 0U;
+  have_minmax = 0U;
+
+  /* ---- 开机自检：横幅 -> 探测传感器 -> 表头 ---- */
+  PrintBanner();
+  UartSend("[BOOT ] firmware start, self-test ...\r\n");
+
+  UartSend("[PROBE] sensor 0x38 ......... ");
+  aht20_ok = (AHT20_Init() == 0U) ? 1U : 0U;
+  UartSend((aht20_ok != 0U) ? "OK\r\n" : "NO ACK\r\n");
+
+  if (aht20_ok == 0U)
+  {
+    UartSend("[WARN ] sensor offline, check PB8=SCL PB9=SDA 3V3 GND\r\n");
+  }
+
+  PrintTableHeader();
+  UartSend("[READY] sampling every 2 s\r\n");
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+
+    /* ---- 心跳：每 500ms 翻转 PA0，灯停止闪烁说明程序卡死 ---- */
+    if ((HAL_GetTick() - tick_led) >= HEARTBEAT_MS)
+    {
+      tick_led = HAL_GetTick();
+      HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_0);
+    }
+
+    /* ---- 每 2 秒采集一次 ---- */
+    if ((HAL_GetTick() - tick_send) >= SAMPLE_PERIOD_MS)
+    {
+      tick_send = HAL_GetTick();
+
+      if (aht20_ok != 0U)
+      {
+        if (AHT20_Read(&t_val, &h_val) == 0U)
+        {
+          /* 成功：更新计数与极值，然后输出一行 */
+          sample_no++;
+
+          if (have_minmax == 0U)
+          {
+            t_min = t_val; t_max = t_val;
+            h_min = h_val; h_max = h_val;
+            have_minmax = 1U;
+          }
+          else
+          {
+            if (t_val < t_min) { t_min = t_val; }
+            if (t_val > t_max) { t_max = t_val; }
+            if (h_val < h_min) { h_min = h_val; }
+            if (h_val > h_max) { h_max = h_val; }
+          }
+
+          PrintRow(sample_no, HAL_GetTick(), t_val, h_val);
+
+          if ((sample_no % SAMPLES_PER_STAT) == 0U) { PrintStat(); }
+        }
+        else
+        {
+          /* 失败：AHT20_Read 内部已经做过 I2C 总线恢复，这里重新探测一次 */
+          fail_cnt++;
+          msg[0] = '\0';
+          AppendStr(msg, "[WARN ] read timeout, fail=");
+          AppendU32(msg, fail_cnt, 0U, ' ');
+          AppendStr(msg, " -> re-probing\r\n");
+          UartSend(msg);
+
+          aht20_ok = (AHT20_Init() == 0U) ? 1U : 0U;
+
+          if (aht20_ok != 0U)
+          {
+            UartSend("[INFO ] sensor back online\r\n");
+            PrintTableHeader();
+          }
+          else
+          {
+            UartSend("[FAIL ] sensor offline\r\n");
+          }
+        }
+      }
+      else
+      {
+        /* 离线状态：每 2 秒重试一次探测 */
+        aht20_ok = (AHT20_Init() == 0U) ? 1U : 0U;
+
+        if (aht20_ok != 0U)
+        {
+          UartSend("[INFO ] sensor online, resume sampling\r\n");
+          PrintTableHeader();
+        }
+        else
+        {
+          fail_cnt++;
+          msg[0] = '\0';
+          AppendStr(msg, "[FAIL ] sensor offline, retry #");
+          AppendU32(msg, fail_cnt, 0U, ' ');
+          AppendStr(msg, "  check PB8/PB9/3V3/GND\r\n");
+          UartSend(msg);
+        }
+      }
+    }
+
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI_DIV2;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL16;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 100000;   /* 100kHz：杜邦线连接时比 400kHz 更稳定 */
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, LED1_Pin|LED2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pins : LED1_Pin LED2_Pin */
+  GPIO_InitStruct.Pin = LED1_Pin|LED2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+#ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
